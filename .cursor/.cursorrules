@@ -1,0 +1,186 @@
+# Muse Backend - Cursor Rules
+
+Authoritative design: `architecture.md`. Phase 1 implementation plan: `phase1.md`.
+When `architecture.md` and `phase1.md` disagree, `architecture.md` wins on contracts
+(schemas, endpoint surface, secrets); `phase1.md` wins on order-of-work and
+implementation-level details the architecture deliberately leaves open.
+
+---
+
+## 1. Language & Style
+
+- Python 3.12+.
+- Type hints on every function argument and return value. No untyped `def`.
+- PEP 8, enforced by Ruff. No manual formatting.
+- Docstrings in NumPy format.
+- Prefer `pathlib` over `os.path`.
+- Prefer list/dict comprehensions over `map`/`filter` for simple transforms.
+
+## 2. Stack (see `architecture.md` §2)
+
+- FastAPI, SQLAlchemy 2.0 (dual engines, see §4 below), Alembic, Celery + RedBeat,
+  Pydantic v2, httpx, structlog, sentry-sdk.
+- PostgreSQL 15 (Cloud SQL), Redis (Memorystore), GCS (`muse-qbo-pdfs`),
+  Resend, GCP Secret Manager.
+
+## 3. Database: Four-Schema Layout
+
+- `auth` -- users, magic_links.
+- `core` -- business domain (companies, contacts, deals, invoices, estimates,
+  purchase_orders, pipeline_stages, mapping_bookmarks).
+- `raw_sync` -- raw JSON from HubSpot/QBO, sync-run metadata, webhook events.
+- `qbo` -- OAuth tokens.
+
+Models live in `app/db/models/` (one file per schema). Never put business logic
+in models -- that belongs in `app/services/` or `app/worker/tasks_*.py`.
+
+Alembic `env.py` must set `include_schemas=True` and a stable
+`version_table_schema` (e.g. `'public'`), or migrations against multi-schema
+tables will misbehave.
+
+## 4. Async vs Sync SQLAlchemy (critical)
+
+FastAPI and Celery use **different** SQLAlchemy engines pointing at the same
+database (see `phase1.md` §3.5):
+
+- FastAPI endpoints: `AsyncSessionLocal` from `app/db/session.py`.
+- Celery tasks: `SyncSessionLocal` from `app/db/session.py`.
+
+Rules:
+
+- Do NOT use async sessions inside Celery tasks.
+- Do NOT wrap sync Celery code in `asyncio.run(...)`.
+- Do NOT assume "ORM code is always async" -- it isn't here.
+
+Pool sizing is budgeted against Cloud SQL's 100-connection cap. When generating
+engine setup, follow `architecture.md` §10.4: `pool_size=5, max_overflow=5` for
+async, `pool_size=1, max_overflow=1` per Celery child, `pool_pre_ping=True`,
+`pool_recycle=1800` on both.
+
+## 5. Upsert Rule: Chronological Guard (critical)
+
+Every write into `raw_sync.*_records` AND every mapper write into `core.*` must
+carry a `source_updated_at` guard. The `core` tables have a `source_updated_at`
+column specifically for this.
+
+```sql
+INSERT INTO <table> (...) VALUES (...)
+ON CONFLICT (<unique_cols>) DO UPDATE SET ...
+WHERE <table>.source_updated_at < EXCLUDED.source_updated_at;
+```
+
+Without this, a late-arriving webhook can overwrite a newer record written by
+the hourly sync, or vice versa. Reviewers will reject upserts that skip the
+guard.
+
+## 6. Tombstoning (deletions)
+
+- `raw_sync.*_records`, `core.companies`, `core.contacts`, `core.deals`,
+  `core.invoices`, `core.estimates`, `core.purchase_orders` all have a
+  nullable `deleted_at TIMESTAMPTZ` column.
+- Portal queries filter `WHERE deleted_at IS NULL` (enforced by partial
+  indexes where added).
+- Never hard-delete upstream-sourced rows; always tombstone.
+- QBO deletions come through CDC (`status='Deleted'`) as part of hourly sync.
+- HubSpot deletions only come through `*.deletion` webhook events.
+  `reconcile_hubspot_deletions` (weekly, `architecture.md` §6.5) is the safety
+  net for missed webhooks.
+
+## 7. Webhooks
+
+- Verify HMAC on **raw bytes** before parsing JSON (`request.body()`).
+- Fail closed: 403 on signature mismatch, write nothing.
+- Respond 200 immediately from the endpoint; queue a Celery task for work.
+- Idempotency: webhook-event tables use the source event ID (HubSpot) or a
+  synthesized key `f"{realmId}:{entityName}:{entityId}:{lastUpdated}"` (QBO) as
+  primary key, so duplicate delivery becomes `ON CONFLICT DO NOTHING`.
+- For QBO invoice/estimate update events, the processor also clears
+  `core.<table>.pdf_gcs_path` and `pdf_cached_at` (PDF cache invalidation,
+  `architecture.md` §5.6).
+
+## 8. QBO Token Refresh
+
+- Tokens live in `qbo.oauth_tokens` keyed by `realm_id`.
+- Refresh inside a Postgres advisory lock to prevent concurrent refreshes from
+  racing:
+  `SELECT pg_advisory_xact_lock(hashtext('qbo:refresh:' || :realm_id));`
+- QBO refresh tokens rotate on each use. The new refresh token MUST be written
+  back in the same transaction as the advisory lock; losing it drops the
+  connection within 100 days.
+- Re-read the token row inside the lock before deciding to refresh -- another
+  transaction may have refreshed while you were waiting.
+
+## 9. Mapping `raw_sync` -> `core`
+
+- One-directional. Never write back from `core` to `raw_sync`.
+- Progress tracked via `core.mapping_bookmarks (connector, last_version, ...)`.
+  The mapper picks up rows with `version > last_version`.
+- Use a module-level field-ownership dict (e.g. `HUBSPOT_OWNED_FIELDS`) so
+  "Portal-owned" columns can be marked and skipped during Phase 2 without a
+  rewrite.
+- The chronological guard applies in the mapper too (§5 above).
+
+## 10. Integrations
+
+- HubSpot client: `app/integrations/hubspot.py`.
+- QBO client: `app/integrations/qbo.py`; OAuth: `app/integrations/qbo_oauth.py`.
+- Secrets: `app/integrations/gcp_secrets.py` (`env var -> in-memory cache ->
+  Secret Manager`; short-circuits to `os.environ` when `GOOGLE_CLOUD_PROJECT`
+  is unset so local dev works without GCP credentials).
+
+## 11. Pydantic Conventions
+
+- Pydantic v2 across the board.
+- All response models set `model_config = ConfigDict(from_attributes=True)`.
+- **Wire format is snake_case.** Do NOT add `alias_generator=to_camel`. The
+  portal consumes a TypeScript SDK generated from `/openapi.json`
+  (`openapi-typescript-codegen`, `architecture.md` §15), which preserves
+  snake_case in TS types and catches field renames as compile errors.
+- Timestamps: ISO 8601 UTC (`"2026-04-22T14:30:00Z"`).
+- Money: serialize `Decimal` as string, not number.
+- IDs: UUIDs as strings.
+
+## 12. Time & Hashing
+
+- Every `TIMESTAMPTZ` and every Python `datetime` is UTC. Coerce at integration
+  boundaries (HubSpot/QBO response parsing). Reject naive datetimes.
+- Content hashing for change detection: `orjson.dumps(payload,
+  option=OPT_SORT_KEYS)` then SHA-256. Sorted keys make the hash order-
+  independent across API calls.
+
+## 13. Observability
+
+- Logs: `structlog` JSON to stdout; Cloud Run auto-ingests into Cloud Logging.
+  Every log line carries a correlation ID (`x-request-id`).
+- Errors: Sentry SDK initialized in both `app/main.py` and
+  `app/worker/celery_app.py` with the same DSN. PII scrubbing on; never log
+  `access_token`, `refresh_token`, `token_hash`, or `*_secret` fields.
+- No OpenTelemetry for now (`architecture.md` §13.2). Don't add it unless
+  explicitly asked.
+
+## 14. Deployment
+
+- Three Cloud Run services from one Docker image: API, Worker, Beat.
+- Beat MUST run as min=max=1 with RedBeat (`celery ... beat -S
+  redbeat.RedBeatScheduler`). Never suggest scaling Beat above 1.
+
+## 15. Testing
+
+- `pytest` + `pytest-asyncio` for async endpoints.
+- Integration tests use `testcontainers` against real Postgres and Redis.
+- Contract tests: `schemathesis run http://localhost:8080/openapi.json
+  --checks=all` in CI. Breaking the contract fails the build; bump `/v1` to
+  `/v2` intentionally.
+- Do not write tests that depend on wall-clock time; use `freezegun` or inject
+  a clock.
+
+## 16. Things That Are Deliberately NOT in Scope
+
+- Multi-tenancy (single-tenant by design; don't add a `TenantMixin`).
+- Hand-rolled JSON serializers for camelCase output.
+- A custom "Token Manager" service for QBO refresh -- the advisory lock is the
+  textbook-correct solution.
+- Full OTEL tracing at three services.
+- Hard-deleting upstream-sourced rows from `core`.
+
+If Cursor is about to generate any of the above, stop and ask.
