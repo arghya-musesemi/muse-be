@@ -1,0 +1,81 @@
+# muse-backend production dependencies.
+# Top-level only; pip resolves transitive deps automatically.
+# Dev / test / lint tooling lives in requirements-dev.txt.
+# See architecture.md §2 for the rationale behind each choice.
+
+# --- Web framework ---
+fastapi==0.135.3
+uvicorn[standard]==0.43.0         # [standard] adds uvloop + httptools for production performance
+
+# --- Data validation & settings ---
+pydantic==2.12.5
+pydantic-settings==2.7.0          # BaseSettings was split out of pydantic v2
+
+# --- Database ---
+SQLAlchemy[asyncio]==2.0.36       # Async (FastAPI) + sync (Celery) engines share the same ORM layer
+alembic==1.14.0
+asyncpg==0.30.0                   # Async driver used by FastAPI endpoints
+psycopg2-binary==2.9.10           # Sync driver used by Celery workers (see architecture.md §10.4)
+
+# --- Background tasks ---
+celery[redis]==5.4.0
+redis==5.2.1
+celery-redbeat==2.3.2             # Singleton Beat with Redis-backed schedule (architecture.md §10.1)
+
+# --- HTTP clients & retry policy ---
+httpx==0.28.1                     # HubSpot + QBO integration clients; also used by FastAPI TestClient in tests
+tenacity==9.0.0                   # Retries on 429s outside Celery's own retry loop
+
+# --- Serialization ---
+orjson==3.10.12                   # Fast JSON + deterministic key-sorted hashing for content_hash
+
+# --- Auth / crypto ---
+PyJWT==2.10.1                     # HS256 session cookies (architecture.md §7.2)
+cryptography==46.0.6               # Fernet encryption for qbo.oauth_tokens (architecture.md §4.5); also used by HMAC webhook verifiers
+
+# --- Observability ---
+structlog==24.4.0                 # JSON logs to Cloud Logging (architecture.md §13.1)
+sentry-sdk[fastapi,celery,sqlalchemy]==2.18.0   # Error tracking (architecture.md §13.2)
+
+# --- GCP integrations ---
+google-cloud-secret-manager==2.27.0
+google-cloud-storage==2.18.2      # GCS client for the PDF cache (architecture.md §5.6)
+
+# --- Email ---
+resend==2.27.0                    # Magic-link delivery (architecture.md §7.1)
+
+# --- GCP dependencies ---
+google-api-core==2.30.2
+google-auth==2.49.1
+google-cloud-secret-manager==2.27.0
+googleapis-common-protos==1.74.0
+grpc-google-iam-v1==0.14.4
+grpcio==1.80.0
+grpcio-status==1.80.0
+
+# Other dependencies
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anyio==4.13.0
+certifi==2026.2.25
+cffi==2.0.0
+charset-normalizer==3.4.7
+click==8.3.2
+cryptography==46.0.6
+fastapi==0.135.3
+h11==0.16.0
+idna==3.11
+proto-plus==1.27.2
+protobuf==6.33.6
+pyasn1==0.6.3
+pyasn1_modules==0.4.2
+pycparser==3.0
+pydantic==2.12.5
+pydantic_core==2.41.5
+requests==2.33.1
+resend==2.27.0
+starlette==1.0.0
+typing-inspection==0.4.2
+typing_extensions==4.15.0
+urllib3==2.6.3
+uvicorn==0.43.0

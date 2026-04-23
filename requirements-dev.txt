@@ -1,0 +1,24 @@
+# muse-backend development / test / lint dependencies.
+# Install: pip install -r requirements-dev.txt  (this also pulls in requirements.txt)
+# NOT copied into the production Docker image -- Dockerfile installs requirements.txt only.
+
+-r requirements.txt
+
+# --- Test framework ---
+pytest==8.3.4
+pytest-asyncio==0.25.0            # Async-native test cases for FastAPI endpoints
+pytest-cov==6.0.0                 # Coverage reports in CI
+
+# --- Test infrastructure ---
+testcontainers[postgres,redis]==4.9.1   # Real Postgres + Redis in integration tests (architecture.md §14.1)
+freezegun==1.5.1                  # Time-based tests without sleeps (.cursorrules §15)
+
+# --- Contract testing ---
+schemathesis==3.38.7              # Property-based fuzzing against /openapi.json (architecture.md §14.2)
+
+# --- Lint / type check ---
+ruff==0.8.4                       # Linter + formatter (.cursorrules §1)
+mypy==1.13.0                      # Type checker; runs in CI alongside ruff
+
+# --- Type stubs ---
+types-PyYAML                      # As needed; add more types-* as imports require them
