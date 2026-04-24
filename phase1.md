@@ -81,13 +81,15 @@ cryptography==46.0.6           # Fernet for qbo.oauth_tokens (architecture.md §
 
 ### 3.3 `docker-compose.yml`
 
-Rename `docker-composer.yml` → `docker-compose.yml` and populate with the services listed in architecture §10.3:
+Rename `docker-composer.yml` → `docker-compose.yml` and populate **from a single source of truth:** copy the `services:` block from `architecture.md` §10.3 (do not maintain a second, "simplified" compose variant). Commands must match prod contracts:
 
-- `api` — `uvicorn app.main:app --reload`
-- `worker` — `celery -A app.worker.celery_app worker -l info`
-- `beat` — `celery -A app.worker.celery_app beat -l info`
+- `api` — `uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload --proxy-headers --forwarded-allow-ips='*'`
+- `worker` — `celery -A app.worker.celery_app worker -l info -c 2 -Q high_priority,default,low_priority`
+- `beat` — `celery -A app.worker.celery_app beat -l info -S redbeat.RedBeatScheduler`
+- `redis` — `redis-server --maxmemory-policy noeviction` (see §10.3)
 - `postgres:15`
-- `redis:7-alpine`
+
+Local `-c 2` on the worker matches architecture §10.3 (lighter than prod `-c 4` because dockerized Postgres defaults to `max_connections=100`).
 
 ### 3.4 Config & Secrets
 
@@ -190,7 +192,7 @@ def upgrade() -> None:
     """), [...])
 ```
 
-Values above are placeholders -- confirm with HubSpot's current pipeline-stage IDs during step 1 of the build order (§7). The daily `sync_hubspot_pipeline_stages` task (architecture.md §6.1) then keeps the table in sync if stages get renamed or reordered; the seed is only the first-boot safety net.
+**Merge gate (mandatory):** the `PIPELINE_STAGES` tuples in `002_seed_pipeline_stages.py` **must** use Muse's **real** `hubspot_stage_id` values from the target HubSpot account (sandbox first, then production) **before** the migration PR is merged. Placeholder internal names are how you get silently wrong `stage_id` FKs. Export the canonical list from HubSpot (`GET /crm/v3/pipelines/deals` or the UI's pipeline settings) and attach it to the PR description. The daily `sync_hubspot_pipeline_stages` task (architecture.md §6.1) keeps the table in sync after first deploy; the seed is the first-boot safety net, not a substitute for correct IDs at merge time.
 
 ### 3.7 Celery App
 
@@ -277,7 +279,8 @@ Refactor of `muse-scripts`' `hsapi/hsapi_token.py`. Responsibilities:
   - `iter_changed_companies(since: datetime)`
   - `iter_changed_deals(since: datetime)`
   - `iter_associations(...)`
-- Use CRM v3 `/search` with filter `hs_lastmodifieddate >= ?` for incremental sync, paginating via the `after` cursor.
+- Use CRM v3 `/search` with filter `hs_lastmodifieddate >= ?` for **incremental** sync, paginating via the `after` cursor.
+- **`reconcile_hubspot_deletions` must not use `/search` to enumerate all IDs** — HubSpot caps search at 10k hits (architecture.md §6.5). That weekly task uses **list/read** pagination (`GET /crm/v3/objects/{type}` with `after`, or documented batch-export patterns) for `fetch_all_ids_via_list_api`.
 - Respect HubSpot rate limits (~100 req / 10 s). Use Celery's `rate_limit="10/s"` plus `tenacity` retries on 429.
 - Return raw dicts — normalization happens in the mapper.
 
@@ -553,8 +556,10 @@ Signature: `base64(HMAC-SHA256(QBO_WEBHOOK_VERIFIER_TOKEN, raw_body))`, compared
 Payload is a batch of `entities` per `realmId`. Processor (`process_qbo_webhook`):
 
 1. Insert into `raw_sync.qbo_webhook_events`. QBO doesn't provide a single event id; synthesize `f"{realmId}:{entityName}:{entityId}:{lastUpdated}"` as the PK.
-2. For each entity, call the QBO API to fetch current state, upsert into `raw_sync.qbo_records`.
+2. For each entity: if the event indicates **delete / tombstone** (`operation=Delete`, `status='Deleted'`, or equivalent in the payload), **upsert `raw_sync.qbo_records` + tombstone `core.*` using ids from the webhook only** — do **not** block on a successful `GET` (deleted entities often return 404). For **creates/updates**, call the QBO API to fetch current state and upsert into `raw_sync.qbo_records` as today.
 3. `map_qbo_to_core.delay(record_ids=...)` for the changed records.
+
+Production **CLI OAuth guardrails** (who runs `scripts/qbo_connect.py`, how `DATABASE_URL` is obtained, audit logging) are contractually defined in `architecture.md` §5.3 — mirror them in the internal runbook when Phase 1 nears prod.
 
 ---
 
@@ -573,7 +578,7 @@ Process object types in dependency order within the same task call:
 5. **`deal_contact`** (part of the association phase) → for each `(deal, contact, association_type)` triple in HubSpot's associations API:
    - If both sides exist in `core`, upsert into `core.deal_contacts` with `deleted_at=NULL`, `source_updated_at = now()`.
    - If either side is missing, skip; the next mapper run retries once its own `deal` / `contact` phase has caught up.
-   - For each local `core.deal_contacts` row whose `(deal, contact, association_type)` is NOT present in the fetched association set for that deal, set `deleted_at = now()` (tombstone). This is how removed associations propagate -- HubSpot has no dedicated "association deleted" webhook payload, so every association fetch is a diff-and-tombstone.
+   - For each local `core.deal_contacts` row whose `(deal, contact, association_type)` is NOT present in the fetched association set for that deal, set `deleted_at = now()` (tombstone). This is how removed associations propagate when HubSpot stops returning an edge: **hourly association sync + mapper diff** is the source of truth. Association-specific webhooks (if subscribed) can shorten latency but are not assumed in Phase 1.
 6. **`deal_company`** → mirror of `deal_contact` above, writing to `core.deal_companies`.
 
 Unmapped/custom properties go into `properties_json`.
@@ -674,12 +679,14 @@ Not called out in `architecture.md` but come up immediately in code:
 - **QBO OAuth in Phase 1 is CLI-only** (architecture.md §5.3, §16). `scripts/qbo_connect.py` on a developer's workstation does the OAuth dance; the public `/v1/admin/qbo/connect` + `/callback` endpoints are Phase 2. No JWT yet, so no public OAuth.
 - **Join tables are the association source of truth.** `core.deal_contacts` and `core.deal_companies` drive deal visibility (architecture.md §5.2 canonical query, §7.4). `core.deals.contact_id` is a display-only hint for the primary contact; never use it for authorization.
 - **Pipeline stages = seed + sync.** Static seed at migration time (§3.6), daily sync afterwards (§3.7). Portal must never render an empty stage dropdown, even before the first `sync_hubspot_pipeline_stages` has run.
-- **Cloud SQL tier at launch is `db-custom-4-15360`** (architecture.md §10.2, §10.4). The ~200-connection cap accommodates the 141-connection peak with ~30% headroom; PgBouncer is deferred. Revisit trigger lives in architecture.md §10.4.
+- **Cloud SQL tier at launch is `db-custom-4-15360`** (architecture.md §10.2, §10.4). The ~200-connection cap accommodates steady-state **~111** connections plus **deploy overlap** (~180 brief peak with API `max=7`); PgBouncer is deferred. Revisit trigger lives in architecture.md §10.4.
 - **JWT session is backend-sole authority** (architecture.md §7.2). `AUTH_SECRET` never ships to Vercel; portal middleware calls `GET /v1/auth/me` instead of decoding the cookie locally. This is relevant to Phase 1 only insofar as it constrains how `auth.py` and `/v1/auth/*` are shaped when they land in Phase 2 -- **don't pre-build a shared-secret JWT flow in Phase 1 that would have to be ripped out for Phase 2.**
 - **HubSpot webhook URL is pinned** (architecture.md §7.3). `settings.hubspot_webhook_url` drives HMAC input; never `str(request.url)`. Add an ingress test (§9) with forged `Host` / `X-Forwarded-Host` headers so this regression can't ship silently.
 - **Secrets in local dev.** `gcp_secrets.py` should short-circuit to `os.environ` when `GOOGLE_CLOUD_PROJECT` is unset.
 - **Content hashing.** Use `orjson.dumps(payload, option=orjson.OPT_SORT_KEYS)` then SHA-256 — deterministic regardless of key order.
 - **Timezone discipline.** Every `TIMESTAMPTZ` column and every Python `datetime` is UTC. Force it at the edge (HubSpot/QBO API response parsing).
+- **HubSpot deletion reconcile:** full-ID scan uses **list/read APIs**, never `/search` (architecture.md §6.5, 10k ceiling).
+- **Phase 2 auth seed:** `scripts/seed_auth_users_from_core_contacts.py` (or migration) before magic links — architecture.md §11, §16 step 4.
 
 ---
 
@@ -690,7 +697,7 @@ Acceptance checks, in rough order. DB-state checks are table-stakes; the failure
 **Schema + bring-up:**
 
 - [ ] `alembic upgrade head` against a fresh Postgres creates all four schemas and every table in architecture §4, **including** `core.mapping_bookmarks` with a composite PK `(connector, object_type)`, `core.deal_contacts` + `core.deal_companies` with composite PKs and partial `deleted_at` indexes, nullable `core.deals.company_id` / `stage_id` / `contact_id`, and `last_mapping_source_id` columns on all six `core` business tables plus both join tables.
-- [ ] After `alembic upgrade head`, `SELECT COUNT(*) FROM core.pipeline_stages` > 0 -- the seed migration (§3.6) has run. The portal's future stage dropdown always has rows.
+- [ ] After `alembic upgrade head`, `SELECT COUNT(*) FROM core.pipeline_stages` > 0 -- the seed migration (§3.6) has run. The portal's future stage dropdown always has rows. **CI / review:** migration PR must not merge until real HubSpot `hubspot_stage_id` values are in `002_seed_pipeline_stages.py` (§3.6 merge gate).
 - [ ] `docker compose up` starts API + worker + beat + Postgres + Redis cleanly. Worker logs `Celery with queues: ['high_priority', 'default', 'low_priority']`. Beat logs `RedBeatScheduler` (not `PersistentScheduler`). `/v1/health` returns 200.
 
 **Scheduled sync:**
@@ -699,12 +706,14 @@ Acceptance checks, in rough order. DB-state checks are table-stakes; the failure
 - [ ] Celery Beat fires `sync_hubspot_pipeline_stages` daily; renaming a stage in the HubSpot sandbox is reflected in `core.pipeline_stages.name` within 24 h.
 - [ ] After a sync, `raw_sync.hubspot_records` and `raw_sync.qbo_records` contain rows whose `payload_json` matches the source API.
 - [ ] Re-running a sync does not create duplicate rows (upsert + chronological guard work).
+- [ ] **`reconcile_hubspot_deletions` uses list/read APIs only** for the full HubSpot ID scan -- code review rejects `/search` for that path (architecture.md §6.5 HubSpot 10k search cap).
 - [ ] A first-ever QBO sync uses `/query` to bootstrap (observable in `raw_sync.qbo_sync_runs.cursor_bookmark`), and subsequent runs use `/cdc`; pausing sync for >29 days and resuming triggers a `/query` fallback (§5.3).
 
 **Webhook ingestion:**
 
 - [ ] Posting a signed HubSpot webhook to `/v1/webhooks/hubspot` returns 200, rows appear in `raw_sync.hubspot_webhook_events`, and the corresponding `raw_sync.hubspot_records` row is updated. The task is picked up by a worker consuming `high_priority`.
 - [ ] Posting a signed QBO webhook to `/v1/webhooks/qbo` behaves the same way.
+- [ ] **QBO delete webhook without live `GET`:** a synthetic or sandbox payload that marks an entity deleted (or simulates 404 on fetch) still tombstones `raw_sync.qbo_records` and the corresponding `core.*` row -- the processor does not require a successful Intuit read for deletes (§5.4).
 - [ ] Posting an **unsigned** or **mis-signed** webhook returns 403 and writes nothing.
 - [ ] **Ingress-realistic HMAC test (forged `Host` + `X-Forwarded-Host`).** Send a legitimate HubSpot-signed webhook (signed against `https://api.muse-semi.com/v1/webhooks/hubspot`) with `Host: attacker.example` and `X-Forwarded-Host: other.example` headers. The endpoint must return **200** (verification succeeded, URI was pulled from `settings.hubspot_webhook_url`, not from the forged request), **not** 403. Conversely, a webhook signed against `https://evil.example/webhooks/hubspot` must return 403 even if the attacker sets `X-Forwarded-Host: api.muse-semi.com`. This catches the whole class of `str(request.url)` regressions that only show up behind ingress.
 - [ ] **Duplicate webhook delivery is idempotent.** POSTing the same HubSpot event twice produces exactly one row in `raw_sync.hubspot_webhook_events` (PK conflict → `DO NOTHING`) and exactly one Celery task attempt's effect on `core.*` (chronological guard → the second write's `source_updated_at` is not strictly greater, so the update is rejected).
@@ -712,7 +721,7 @@ Acceptance checks, in rough order. DB-state checks are table-stakes; the failure
 
 **QBO OAuth (CLI) + token storage:**
 
-- [ ] `python scripts/qbo_connect.py` against the sandbox populates `qbo.oauth_tokens`; inspecting the raw Postgres bytes shows `access_token` and `refresh_token` are **encrypted ciphertext**, not plaintext. Reading the same rows via SQLAlchemy returns plaintext strings.
+- [ ] `python scripts/qbo_connect.py` against the sandbox populates `qbo.oauth_tokens`; inspecting the raw Postgres bytes shows `access_token` and `refresh_token` are **encrypted ciphertext**, not plaintext. Reading the same rows via SQLAlchemy returns plaintext strings. **Prod:** operator access follows architecture.md §5.3 guardrails (no committed prod `DATABASE_URL`, Cloud SQL Auth Proxy or equivalent, structured audit log on token write).
 - [ ] Forcing an expired access token triggers a refresh under an advisory lock with no duplicate refresh calls, and the new refresh token is written back in the same transaction.
 - [ ] **QBO OAuth callback retry / resume.** Killing `scripts/qbo_connect.py` between Intuit's redirect and the token-exchange POST leaves `qbo.oauth_tokens` untouched; re-running the script completes successfully (no half-state).
 

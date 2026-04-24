@@ -226,12 +226,23 @@ rules are tripwires for the moment those endpoints start getting written.
 ## 11. Integrations
 
 - HubSpot client: `app/integrations/hubspot.py`.
+- **`reconcile_hubspot_deletions` full-ID enumeration:** use CRM v3 **list/read**
+  pagination (`GET /crm/v3/objects/{type}` with `after`, or HubSpot-documented
+  batch export). **Never** use `/search` for the weekly "all live IDs" set --
+  search is capped at **10,000** hits and will false-tombstone real rows
+  (`architecture.md` §6.5). `/search` with `hs_lastmodifieddate` remains valid
+  for **hourly incremental** sync only.
 - QBO client: `app/integrations/qbo.py`; OAuth: `app/integrations/qbo_oauth.py`.
 - **QBO OAuth in Phase 1 is CLI-only** (`architecture.md` §5.3). The
   `scripts/qbo_connect.py` entry point runs on a developer workstation;
   do NOT add public `/v1/admin/qbo/*` HTTP endpoints until Phase 2 when
   the JWT middleware lands. The HTTP endpoints and the CLI tool share the
   same `qbo_oauth.py` token-exchange logic -- don't duplicate the code.
+  Prod token writes follow §5.3 guardrails (operator allowlist, proxy-based
+  `DATABASE_URL`, structured audit log, no secrets in git).
+- **QBO webhook / CDC deletes:** tombstone `raw_sync` + `core` from **event
+  ids and delete markers**; do not require a successful follow-up `GET`
+  (`architecture.md` §6.2).
 - Secrets: `app/integrations/gcp_secrets.py` (`env var -> in-memory cache ->
   Secret Manager`; short-circuits to `os.environ` when `GOOGLE_CLOUD_PROJECT`
   is unset so local dev works without GCP credentials).
@@ -296,8 +307,12 @@ rules are tripwires for the moment those endpoints start getting written.
   - Weekly/monthly reconciles (`reconcile_hubspot_deletions`,
     `cleanup_orphan_pdfs`) -> `low_priority`.
 - Cloud SQL tier at launch is `db-custom-4-15360` (~200 connections,
-  `architecture.md` §10.4). PgBouncer is deferred; the revisit triggers
-  are in §10.4.
+  `architecture.md` §10.4). API Cloud Run **max instances = 7** in Phase 1
+  unless overlap math in §10.1 / §10.4 is recomputed after pool changes.
+  PgBouncer is deferred; the revisit triggers are in §10.4.
+- **GCS V4 signed URLs:** the API runtime service account needs
+  `roles/iam.serviceAccountTokenCreator` **on itself** for `signBlob`
+  (`architecture.md` §10.2, §5.6).
 
 ## 16. Testing
 

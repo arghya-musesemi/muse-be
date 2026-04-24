@@ -44,7 +44,7 @@ After this project is complete:
 
 ```mermaid
 graph TD
-  subgraph frontend [Frontend - Vercel]
+  subgraph frontend [Frontend — Vercel or GCP]
     NextJS["muse-portal (Next.js, UI only)"]
   end
 
@@ -69,7 +69,7 @@ graph TD
     SecretManager[Secret Manager]
   end
 
-  NextJS -->|"HTTP + JWT cookie"| FastAPI
+  NextJS -->|"HTTP + session cookie (JWT)"| FastAPI
   HubSpotWH[HubSpot Webhook] -->|HTTP POST| FastAPI
   QboWH[QBO Webhook] -->|HTTP POST| FastAPI
 
@@ -86,6 +86,8 @@ graph TD
   FastAPI -->|load secrets| SecretManager
   CeleryWorker -->|load secrets| SecretManager
 ```
+
+Hosting for `muse-portal` is **not locked**: Vercel, Cloud Run behind a load balancer, or another GCP surface are all compatible with the backend contract. Cookie `SameSite`, CORS, and optional CSRF differ by topology — see §7.6 (Options A, B, and C).
 
 ### 3.2 Data Flow
 
@@ -127,7 +129,7 @@ Handles passwordless magic-link authentication. Isolated from business data so t
 | Column | Type | Constraints | Notes |
 |---|---|---|---|
 | `id` | `UUID` | PK, default `gen_random_uuid()` | Internal user ID |
-| `email` | `TEXT` | UNIQUE, NOT NULL | Login identity; initially seeded from HubSpot contacts |
+| `email` | `TEXT` | UNIQUE, NOT NULL | Login identity. **Phase 1:** table may be empty or hold only manual test rows — HubSpot → `core` sync does not populate `auth.users`. **Phase 2:** seeded idempotently from `core.contacts` (plus `ADMIN_EMAILS` admin bootstrap) via an explicit migration or `scripts/seed_auth_users_from_core_contacts.py` before magic links go live (§11) |
 | `display_name` | `TEXT` | | Full name for UI display |
 | `role` | `TEXT` | NOT NULL, default `'customer'` | `'admin'` / `'customer'` (replaces `ADMIN_EMAILS` env var) |
 | `is_active` | `BOOLEAN` | NOT NULL, default `true` | Soft-disable without deleting |
@@ -620,6 +622,13 @@ Admin-role queries (`role = 'admin'` on `auth.users`) skip the `JOIN` and read `
 
 The public `/v1/admin/qbo/connect` + `/v1/admin/qbo/callback` endpoints land in Phase 2 **after** the JWT middleware is live, and reuse the same underlying `app/integrations/qbo_oauth.py` token-exchange logic. In the meantime, refresh tokens rotate automatically during normal sync (§4.5 advisory-lock refresh); the CLI tool is only needed for the initial connect and for break-glass re-connection scenarios.
 
+**Production guardrails for CLI OAuth (who may write `qbo.oauth_tokens`).** The script uses whatever `DATABASE_URL` (and `QBO_*` secrets) are in the operator's environment — that is equivalent to database superpower for the `qbo` schema. Document and enforce:
+
+- **Who:** only engineers with production DB access (same group that can run Alembic against prod). Prefer a named allowlist in internal runbooks, not "any laptop with a leaked `.env`."
+- **How `DATABASE_URL` is obtained:** never commit prod connection strings. Prefer **Cloud SQL Auth Proxy** (or IAM-authenticated connector) plus a Secret Manager pull at session start, or a **break-glass** bastion where `DATABASE_URL` exists only in ephemeral shell env. VPN / Zero Trust to reach the proxy matches your org's existing prod access path.
+- **Audit:** log (structured, to Cloud Logging) each successful `upsert_tokens` with `realm_id`, operator identity if available (e.g. `gcloud auth list` user from runbook step), and **never** log token material.
+- **Staging first:** run the CLI against sandbox + staging DB before prod; redirect URI and Intuit app credentials differ per environment.
+
 ### 5.4 Webhook Endpoints (HMAC Signature Required)
 
 | Method | Path | Description |
@@ -648,7 +657,7 @@ QBO's `/invoice/{id}/pdf` and `/estimate/{id}/pdf` endpoints are slow (typically
 **Read path (`GET /v1/invoices/{id}/pdf`):**
 
 1. Load `core.invoices` by `id`. Check access control against the caller's contact.
-2. If `pdf_gcs_path IS NOT NULL`, mint a V4 signed URL (15-minute lifetime) and return `{ url, expires_at }`.
+2. If `pdf_gcs_path IS NOT NULL`, mint a V4 signed URL (15-minute lifetime) and return `{ url, expires_at }`. Signing requires the Cloud Run **runtime service account** to have permission to `signBlob` — see §10.2 (`roles/iam.serviceAccountTokenCreator` on itself).
 3. Otherwise: fetch the PDF from QBO, upload to GCS at the object key above, `UPDATE core.invoices SET pdf_gcs_path = ?, pdf_cached_at = now()`, then mint and return the signed URL.
 4. The portal follows the URL directly from the browser; the backend is not in the byte path.
 
@@ -684,12 +693,14 @@ Most invoices are never viewed. Eagerly generating PDFs on sync would waste GCS 
 | `cleanup_orphan_pdfs` | Monthly, 1st @ 04:00 UTC | Delete GCS PDF objects no longer referenced by any `core.invoices` / `core.estimates` row |
 | `cleanup_expired_magic_links` | Daily at 3 AM | Purge `auth.magic_links` older than 24 hours |
 
+**HubSpot association → join-table tombstones (exact mechanics).** There is no durable "full graph snapshot" of every association in the DB. Correctness comes from three layers: (1) **Hourly `sync_hubspot_associations`** re-fetches association edges from HubSpot's Associations API and upserts `raw_sync.hubspot_records` with `object_type='deal_contact'` / `'deal_company'`. (2) The mapper's **`deal_contact` / `deal_company` phases** (phase1.md §6.1) **diff** the current upstream edge set for each deal against `core.deal_contacts` / `core.deal_companies` and **tombstone** (`deleted_at = now()`) rows HubSpot no longer returns — this covers silent de-associations when no webhook fires. (3) **HubSpot association webhooks** (if subscribed) should upsert or tombstone the corresponding `raw_sync` rows immediately so the mapper can run before the next hourly sync. **`reconcile_hubspot_deletions`** (§6.5) only addresses **object** deletion (contact/company/deal gone), not edge-only changes; edge drift is covered by (1)+(2).
+
 ### 6.2 Webhook Processing Tasks (On-Demand)
 
 | Task | Triggered By | Description |
 |---|---|---|
 | `process_hubspot_webhook` | `POST /v1/webhooks/hubspot` | Parse event, upsert `raw_sync.hubspot_webhook_events` + `raw_sync.hubspot_records` (set `deleted_at` on `*.deletion` events), then map to `core` |
-| `process_qbo_webhook` | `POST /v1/webhooks/qbo` | Parse event, upsert `raw_sync.qbo_webhook_events` + `raw_sync.qbo_records`, then map to `core`. For invoice/estimate update events, additionally `UPDATE core.<table> SET pdf_gcs_path = NULL, pdf_cached_at = NULL WHERE qbo_*_id = ?` to invalidate the PDF cache (see §5.6) |
+| `process_qbo_webhook` | `POST /v1/webhooks/qbo` | Parse event, upsert `raw_sync.qbo_webhook_events` + `raw_sync.qbo_records`, then map to `core`. For invoice/estimate update events, additionally `UPDATE core.<table> SET pdf_gcs_path = NULL, pdf_cached_at = NULL WHERE qbo_*_id = ?` to invalidate the PDF cache (see §5.6). **Deletes:** when the payload indicates removal (`operation=Delete`, `status='Deleted'` in CDC-shaped payloads, or equivalent), **tombstone `raw_sync` + `core` by entity id from the webhook alone** — do not require a successful follow-up `GET` to Intuit (deleted entities often 404). Optionally enqueue a best-effort fetch for diagnostics; mapping must not depend on it. |
 
 ### 6.3 Task Configuration
 
@@ -730,7 +741,9 @@ Contacts, companies, and deals sync in parallel (they are independent API calls)
 
 ### 6.5 HubSpot Deletion Reconcile (`reconcile_hubspot_deletions`)
 
-HubSpot's `/crm/v3/objects/{type}/search` endpoint, filtered by `hs_lastmodifieddate`, is the backbone of the hourly sync -- but **deleted records never appear in its results**. Deletions are only surfaced via `*.deletion` webhook events. If a webhook is lost (HubSpot outage, our endpoint returns non-2xx during a deploy, a partition drop on our webhook table, etc.), the record lingers in `raw_sync.hubspot_records` and `core` forever.
+HubSpot's `/crm/v3/objects/{type}/search` endpoint, filtered by `hs_lastmodifieddate`, is the backbone of the **hourly incremental sync** -- but **deleted records never appear in its results**. Deletions are only surfaced via `*.deletion` webhook events. If a webhook is lost (HubSpot outage, our endpoint returns non-2xx during a deploy, a partition drop on our webhook table, etc.), the record lingers in `raw_sync.hubspot_records` and `core` forever.
+
+**Critical: do not use `/search` to build the weekly "all live IDs" set.** HubSpot's search API returns at most **10,000** hits per query; beyond that, results are truncated. Using search for `fetch_all_ids_from_hubspot` would falsely mark every local row whose HubSpot id sorts after the 10,000th hit as "deleted" and tombstone good data. The weekly reconcile's `fetch_all_ids_from_hubspot` **must** use the CRM v3 **basic read / list** APIs (`GET /crm/v3/objects/{type}` with `after` cursor pagination, or batch read patterns HubSpot documents for full exports), which paginate through the **entire** object set. Hourly incremental sync continues to use `/search` with `hs_lastmodifieddate` filters -- that is a different code path with a different contract.
 
 QBO does not have this problem: its CDC endpoint returns deleted entities with `status='Deleted'`, so scheduled sync handles it natively.
 
@@ -740,7 +753,8 @@ QBO does not have this problem: its CDC endpoint returns deleted entities with `
 @shared_task(bind=True)
 def reconcile_hubspot_deletions(self):
     for object_type in ("contact", "company", "deal"):
-        live_ids_upstream: set[str] = fetch_all_ids_from_hubspot(object_type)  # paginated
+        # MUST use list/read pagination -- NOT /search (10k cap).
+        live_ids_upstream: set[str] = fetch_all_ids_via_list_api(object_type)
         known_ids_local: set[str] = db.query(
             "SELECT source_id FROM raw_sync.hubspot_records "
             "WHERE object_type = :t AND deleted_at IS NULL",
@@ -906,7 +920,7 @@ The canonical deal-visibility contract is the SQL in §5.2. `core.deals.contact_
 
 ### 7.6 CORS & Domain Topology
 
-**Status: DECISION PENDING.** The final deployment topology of `muse-portal` (Vercel) and `muse-backend` (Cloud Run) has not been locked, and that choice drives cookie `SameSite`, CORS policy, and whether explicit CSRF protection is required. Both paths are documented below; the default in `app/main.py` is **Option A** (same-site subdomains) because it's the lowest-risk configuration and can be tightened without a schema change if the final call is Option B.
+**Status: DECISION PENDING.** The final deployment topology of `muse-portal` (Vercel, Cloud Run, or other) and `muse-backend` (Cloud Run) has not been locked, and that choice drives cookie `SameSite`, CORS policy, and whether explicit CSRF protection is required. Three paths are documented below; the default in `app/main.py` is **Option A** (same-site subdomains) because it's the lowest-risk configuration and can be tightened without a schema change if the final call is Option B or C.
 
 #### Option A -- Same-site sibling subdomains (default, recommended)
 
@@ -927,6 +941,15 @@ Example: `muse-portal.com` + `muse-api.com`.
 - **Pros:** clean separation of brand domains.
 - **Cons:** more moving parts; harder to debug when a third-party ad-blocker or browser lockdown setting strips `SameSite=None` cookies.
 
+#### Option C -- Portal on GCP behind a shared load balancer (same-site origin)
+
+Example: `https://www.muse-semi.com` (portal static or Cloud Run) and `https://www.muse-semi.com/api/...` (API) routed by URL map to two Cloud Run (or Run + Cloud CDN) backends so the browser sees **one origin**.
+
+- **Cookie:** `SameSite=Strict` (or `Lax` if you also serve purely navigational cross-site links) becomes viable because API and portal share the eTLD+1.
+- **CORS:** often **unnecessary** for first-party browser calls if all XHR/fetch targets the same origin; keep CORS middleware configured defensively for non-browser clients if needed.
+- **Pros:** strongest cookie story; no cross-site credential dance; aligns with "frontend moves to GCP" without giving up security.
+- **Cons:** requires coordinated infra (LB, DNS, deploy ordering); local dev still uses split origins (`localhost` + `127.0.0.1` tricks or a dev proxy).
+
 #### What the code looks like either way
 
 ```python
@@ -945,7 +968,7 @@ app.add_middleware(
 
 `settings.portal_origin` and the cookie settings are environment-scoped so staging and production can differ -- e.g. staging uses Option A under `*.muse-staging.com`, production uses whatever the final call is.
 
-**Before Phase 2 portal work begins, the final domain topology MUST be locked in** -- the CSRF surface is materially different between the two options and cannot be retrofitted without a coordinated portal + backend deploy.
+**Before Phase 2 portal work begins, the final domain topology MUST be locked in** -- the CSRF surface is materially different between Options A, B, and C and cannot be retrofitted without a coordinated portal + backend deploy.
 
 ---
 
@@ -1096,7 +1119,7 @@ One Docker image, three entrypoints:
 
 | Cloud Run Service | Command | Scaling | Purpose |
 |---|---|---|---|
-| `muse-backend-api` | `uvicorn app.main:app --host 0.0.0.0 --port 8080 --proxy-headers --forwarded-allow-ips='*'` | min=1, max=10, autoscale on CPU/concurrency | HTTP API server. `--proxy-headers` is **required** so `request.url` respects Cloud Run's `X-Forwarded-*` injection (§7.3) |
+| `muse-backend-api` | `uvicorn app.main:app --host 0.0.0.0 --port 8080 --proxy-headers --forwarded-allow-ips='*'` | min=1, **max=7** (Phase 1; deploy overlap + §10.4), autoscale on CPU/concurrency | HTTP API server. `--proxy-headers` is **required** so `request.url` respects Cloud Run's `X-Forwarded-*` injection (§7.3) |
 | `muse-backend-worker` | `celery -A app.worker.celery_app worker -l info -c 4 -Q high_priority,default,low_priority` | min=1, max=5, autoscale on queue depth (custom metric) | Background task processor. Queue list is **not optional** (§6.6) -- workers without `-Q` silently consume only the `celery` default queue |
 | `muse-backend-beat` | `celery -A app.worker.celery_app beat -l info -S redbeat.RedBeatScheduler` | **min=1, max=1** (hard singleton) | Cron scheduler |
 
@@ -1108,15 +1131,18 @@ One Docker image, three entrypoints:
 
 **Worker concurrency (`-c 4`)** is conservative because Cloud Run gives each instance limited memory and each Celery child process holds its own SQLAlchemy connection. See §10.4 for the pool arithmetic.
 
+**Deploy overlap vs. Cloud SQL connections.** During a revision rollout, **old and new API revisions can both be warm for roughly one max-request timeout window**, so API replicas (and thus async DB pools) can **briefly double**. With `pool_size=5, max_overflow=5` (10 connections per API replica), `2 × max_api_replicas × 10` API connections must stay **below** the Cloud SQL cap **minus** worker + beat + headroom (§10.4). **Rule of thumb at current pool settings:** keep `max` API instances at **7** in Phase 1 unless pool sizes or per-replica concurrency drop -- at `max=7`, overlap is at most `2×7×10 = 140` API connections, leaving ~60 connections for workers + beat + margin on `db-custom-4-15360`. Recompute this inequality whenever `pool_size`, `max_overflow`, or `-c` changes.
+
 ### 10.2 GCP Infrastructure
 
 | Service | Tier / Notes | Purpose |
 |---|---|---|
-| **Cloud Run** (x3) | API (min=1 max=10), Worker (min=1 max=5), Beat (min=max=1) | API, Worker, Beat |
+| **Cloud Run** (x3) | API (min=1 max=7 recommended Phase 1 cap; see §10.1 deploy overlap), Worker (min=1 max=5), Beat (min=max=1) | API, Worker, Beat |
 | **Cloud SQL (PostgreSQL 15)** | `db-custom-4-15360` (~200 connections) at launch | Database. Sizing commits to the §10.4 mitigation; revisit per §10.4's trigger table |
 | **Cloud SQL Auth Proxy** | | Sidecar on all Cloud Run services |
-| **Memorystore (Redis)** | Standard tier, 1 GB, `maxmemory-policy=noeviction` | Celery message broker + RedBeat schedule storage. `noeviction` is mandatory -- the default `allkeys-lru` would silently drop queued Celery tasks and scheduled RedBeat entries under memory pressure |
+| **Memorystore (Redis)** | Standard tier, 1 GB, `maxmemory-policy=noeviction` | Celery message broker + RedBeat schedule storage. `noeviction` is mandatory -- the default `allkeys-lru` would silently drop queued Celery tasks and scheduled RedBeat entries under memory pressure. **Failure mode:** at 100% memory, **writes stall** (publish/enqueue fails) -- this is a full **outage for webhook acceptance and scheduling**, not a benign cache miss. See §13.4 for alerts |
 | **GCS bucket (`muse-qbo-pdfs`)** | Regional, same region as Cloud Run | Cached QBO PDFs (see §5.6) |
+| **IAM (PDF signing)** | Runtime service account: `roles/iam.serviceAccountTokenCreator` **on itself** (principal = same SA) | V4 signed URLs from Cloud Run require `signBlob`. Without this grant, `GET /v1/invoices/{id}/pdf` fails at signing time with permission errors |
 | **Secret Manager** | | All secrets |
 | **Artifact Registry** | | Docker image storage |
 | **Sentry (external)** | | Error tracking and alerting (see §13) |
@@ -1172,16 +1198,18 @@ Local worker concurrency is `-c 2` rather than prod's `-c 4` because local Postg
 
 Cloud SQL caps total connections by tier. The backend has two independent pools (async for FastAPI, sync for Celery) running on multiple Cloud Run instances, so pool budgeting is easy to get wrong and hard to notice until traffic spikes exhaust the server.
 
-**Budget (worst case, all services at max replicas):**
+**Budget (steady state, all services at max replicas — Phase 1 API `max=7` per §10.1):**
 
 | Service | Replicas (max) | Pool per replica | Total |
 |---|---|---|---|
-| `muse-backend-api` (async `asyncpg`) | 10 | `pool_size=5`, `max_overflow=5` | 100 |
+| `muse-backend-api` (async `asyncpg`) | 7 | `pool_size=5`, `max_overflow=5` | 70 |
 | `muse-backend-worker` (sync `psycopg2`) | 5 × 4 concurrency | `pool_size=1`, `max_overflow=1` per child | 40 |
 | `muse-backend-beat` | 1 | `pool_size=1` (no overflow) | 1 |
-| Total | | | ~141 |
+| Total | | | ~111 |
 
-**Decision: launch on `db-custom-4-15360` (~200 connections).** 141 worst-case fits inside 200 with ~30% headroom. `db-custom-2-7680` (~100) would require cutting the API pool to `pool_size=3, max_overflow=3` for a 101-connection total -- a 1-connection margin of error is not an operating plan, it's a failure waiting for a spike.
+**Deploy overlap (same pool settings):** during revision cutover, assume up to **14** warm API replicas (`2 × 7`). That yields up to `14 × 10 = 140` API connections, plus **40** worker connections = **180**, still under **200** on `db-custom-4-15360` with a **20-connection** margin for admin sessions, migrations, and telemetry. If you raise API `max` above 7 without shrinking pools or concurrency, **recompute** `2 × max_api_replicas × (pool_size + max_overflow) + worker_total < 200 - buffer`.
+
+**Decision: launch on `db-custom-4-15360` (~200 connections).** The Phase 1 cap + overlap math above fits inside 200. `db-custom-2-7680` (~100) would require cutting the API pool to `pool_size=3, max_overflow=3` for a 101-connection total -- a 1-connection margin of error is not an operating plan, it's a failure waiting for a spike.
 
 **PgBouncer is explicitly deferred.** Running transaction-pooling PgBouncer in front of Cloud SQL would cap connections at the pool-size-count regardless of client count, but it also disables prepared statements, breaks session-scoped `SET LOCAL` tuning, interferes with Alembic's migration transactions, and breaks `pg_advisory_lock` when held across statements (though our `pg_advisory_xact_lock` usage in §4.5 is transaction-scoped and safe). The operational cost of debugging those interactions is higher than a tier upgrade until the fleet grows.
 
@@ -1191,7 +1219,7 @@ Cloud SQL caps total connections by tier. The backend has two independent pools 
 |---|---|
 | `db_pool_in_use / pool_total > 0.6` sustained over 7 days | Raise Cloud SQL tier one step (`db-custom-8-30720`) |
 | Worker replicas go above 2 at max scale | Audit pool math; consider PgBouncer for session-pooling mode |
-| API replicas regularly hit max=10 under normal traffic | Evaluate PgBouncer in session-pooling mode (not transaction-pooling) |
+| API replicas regularly hit the configured `max` under normal traffic | Evaluate PgBouncer in session-pooling mode (not transaction-pooling), or raise Cloud SQL tier after recomputing overlap |
 
 §13.4's alert at `> 0.6` (not `> 0.8`) is deliberately the soft capacity-planning alert, not the hard pool-exhaustion alert (§13.4 also has `> 0.8`).
 
@@ -1223,7 +1251,7 @@ The worker concurrency `-c 4` means Celery forks 4 child processes; each child h
 - **HubSpot Status:** Source of Truth.
 - **Data Flow:** HubSpot -> `raw_sync.hubspot_records` -> mapping worker -> `core` tables (companies, contacts, deals).
 - **Portal:** Reads from `core` via `muse-backend` API. Does not write CRM data.
-- **Auth:** Magic links validate against `auth.users`, which is seeded from HubSpot contacts during initial migration.
+- **Auth:** `auth.users` is **not** populated from HubSpot in Phase 1. Magic links and JWT (step 4, §16) land in Phase 2 together with an explicit **`scripts/seed_auth_users_from_core_contacts.py`** (or idempotent Alembic data migration): insert one `auth.users` row per portal-eligible `core.contacts` row (by email), merge `ADMIN_EMAILS` into `role = 'admin'`, and **never** overwrite existing rows' roles blindly on re-run. Until that script runs, `auth.users` may be empty.
 - **QBO:** Syncs into `raw_sync.qbo_records` -> mapping worker -> `core.invoices`, `core.estimates`, etc.
 
 ### Phase 2: Co-existence
@@ -1232,6 +1260,7 @@ The worker concurrency `-c 4` means Celery forks 4 child processes; each child h
 - **Data Flow:** Some data entered in the Portal (e.g., deal notes, custom fields), some in HubSpot. Both write to `core`.
 - **Conflict Resolution:** Field-level authority. Each column in `core.deals` has an explicit owner (HubSpot or Portal). The mapping worker skips columns owned by the Portal. The chronological upsert guard (`source_updated_at`) prevents stale HubSpot data from overwriting newer Portal edits.
 - **Portal:** Begins writing to `core` tables via `muse-backend` API (e.g., `PATCH /v1/deals/{id}`).
+- **Auth bootstrap:** Before enabling magic links in production, run the **auth user seed** (`scripts/seed_auth_users_from_core_contacts.py` or equivalent migration) so every customer email in `core.contacts` has a matching `auth.users` row. Link `core.contacts.user_id` in a follow-up step or within the same script where appropriate. This removes ambiguity between "HubSpot is source of truth for CRM" and "auth.users is source of truth for login."
 
 ### Phase 3: Master
 
@@ -1315,7 +1344,7 @@ Custom metrics via Cloud Monitoring (Prometheus format exposed on `/metrics` ins
   - Celery queue depth > 100 sustained for 5 min
   - `db_pool_in_use / pool_total > 0.6` sustained for 7 days (soft capacity-planning signal, §10.4 revisit trigger)
   - `db_pool_in_use / pool_total > 0.8` for 5 min (hard early warning for §10.4 pool exhaustion)
-  - `redis.googleapis.com/stats/memory/usage_ratio` > 0.8 sustained (Memorystore is `noeviction`; running out of memory fails publishes, which loses scheduled tasks and webhook fan-out)
+  - **Redis memory (`noeviction` failure mode):** `redis.googleapis.com/stats/memory/usage_ratio` **> 0.8** sustained = capacity warning (broker still healthy, but schedule growth / large payloads need attention). **> 0.9** sustained = **P1** -- approaching OOM where **new publishes fail** (webhooks return 500, Beat cannot enqueue), unlike an LRU cache that silently evicts keys.
   - `qbo.oauth_tokens.refresh_token_expires_at` within 14 days (checked by a daily Celery task)
 
 ---
@@ -1402,9 +1431,9 @@ No `alias_generator`, no manual casing conversions. Consistency across the API i
 | Step | What | Depends On |
 |---|---|---|
 | 1 | Scaffold FastAPI + Celery + `docker-compose.yml` (mirror-prod flags, §10.3); wire Sentry SDK (§13.2) | Nothing |
-| 2 | Alembic migration: all four schemas and tables including `core.mapping_bookmarks` composite PK with `pipeline_stage` / `deal_contact` / `deal_company` enum values (§4.3), `core.deal_contacts` and `core.deal_companies` join tables, `source_updated_at` + `last_mapping_source_id` + `deleted_at` on every `core.*` table, `pdf_gcs_path` / `pdf_cached_at` on invoices + estimates, nullable `core.deals.company_id` / `stage_id` / `contact_id`. **Plus a data migration that seeds `core.pipeline_stages`** from a hardcoded list of Muse's current HubSpot pipelines so the portal never renders an empty stage dropdown | Step 1 |
+| 2 | Alembic migration: all four schemas and tables including `core.mapping_bookmarks` composite PK with `pipeline_stage` / `deal_contact` / `deal_company` enum values (§4.3), `core.deal_contacts` and `core.deal_companies` join tables, `source_updated_at` + `last_mapping_source_id` + `deleted_at` on every `core.*` table, `pdf_gcs_path` / `pdf_cached_at` on invoices + estimates, nullable `core.deals.company_id` / `stage_id` / `contact_id`. **Plus a data migration that seeds `core.pipeline_stages`** from a hardcoded list of Muse's **actual** HubSpot pipeline stage IDs (verified in HubSpot **before** the migration PR merges — placeholders are not mergeable; see phase1.md §3.6 merge gate) | Step 1 |
 | 3 | `gcp_secrets.py` + `config.py` (secret resolution, including `HUBSPOT_WEBHOOK_URL` and `PORTAL_ORIGIN`). Configure dual SQLAlchemy engines (async + sync) with pool sizing per §10.4. Wire Fernet `EncryptedToken` TypeDecorator for `qbo.oauth_tokens` (§4.5) | Step 1 |
-| 4 | Auth endpoints (magic link send/verify, JWT session with backend-sole-authority pattern per §7.2, `GET /v1/auth/me`). **Deferred to Phase 2** -- Phase 1 protects admin functions via the CLI flow in step 5a, not via the JWT middleware | Steps 2, 3 |
+| 4 | Auth endpoints (magic link send/verify, JWT session with backend-sole-authority pattern per §7.2, `GET /v1/auth/me`). **Plus** idempotent **`scripts/seed_auth_users_from_core_contacts.py`** (or Alembic data migration): create `auth.users` from `core.contacts` emails, apply `ADMIN_EMAILS` admin bootstrap once, document re-run semantics. **Deferred to Phase 2** -- Phase 1 protects admin functions via the CLI flow in step 5a, not via the JWT middleware | Steps 2, 3 |
 | 5 | HubSpot integration client (refactor `hsapi_token.py`) | Step 3 |
 | 5a | **QBO OAuth via CLI (pulled forward).** `scripts/qbo_connect.py` runs on a developer's workstation, opens the Intuit authorize URL, receives the callback on `localhost:8080`, writes Fernet-encrypted tokens into the target environment's `qbo.oauth_tokens` via its `DATABASE_URL`. Reuses the same `app/integrations/qbo_oauth.py` token-exchange logic the Phase-2 HTTP endpoints will use. Validates credentials / redirect URI / sandbox quirks in week 1, not week 3, **and** avoids putting an unauthenticated OAuth redirect on a public Cloud Run URL before JWT auth exists (§5.3) | Step 3 |
 | 6 | HubSpot hourly sync Celery tasks (contacts, companies, deals, associations) + **daily `sync_hubspot_pipeline_stages` task** (§6.1) + dependency-ordered mapping to `core` starting with `pipeline_stage` phase; per-object-type bookmarks in `core.mapping_bookmarks`; association phase upserts `core.deal_contacts` / `core.deal_companies` and tombstones removed associations (§6.6 for queue routing) | Steps 2, 5 |
@@ -1417,4 +1446,4 @@ No `alias_generator`, no manual casing conversions. Consistency across the API i
 | 13 | Portal invoice/estimate/PO endpoints + PDF cache-first flow (§5.6) + GCS bucket + `cleanup_orphan_pdfs` monthly task (`low_priority` queue). **Phase 2** (requires step 4) | Steps 2, 4, 10 |
 | 14 | OpenAPI spec freeze + `schemathesis` CI job + first SDK generation for `muse-portal` (§14, §15) | Steps 4, 9, 13 |
 | 15 | Strip `muse-portal`: remove all `/api` routes and backend modules; portal consumes the generated SDK | Step 14 |
-| 16 | Deploy to Cloud Run (API with `--proxy-headers`, Worker with `-Q high_priority,default,low_priority`, Beat as RedBeat singleton per §10.1) on `db-custom-4-15360` | All above |
+| 16 | Deploy to Cloud Run (API with `--proxy-headers`, **API max instances = 7** Phase 1 per §10.1 overlap math, Worker with `-Q high_priority,default,low_priority`, Beat as RedBeat singleton per §10.1) on `db-custom-4-15360`; grant API SA `roles/iam.serviceAccountTokenCreator` on itself for GCS V4 signing (§10.2) | All above |
